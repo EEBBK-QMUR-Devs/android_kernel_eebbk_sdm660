@@ -459,6 +459,14 @@ config BACKLIGHT_BD6107
 	depends on I2C
 	help
 	  If you have a Rohm BD6107 say Y to enable the backlight driver.
+	  
+config BACKLIGHT_KTZ8864
+	tristate "KTZ8864A 4-CH LED Backlight Driver"
+	depends on I2C
+	help
+	  This supports the Kinetic Technologies KTZ8864A 4-channel LED
+	  backlight driver with dual LCD bias power. Brightness is
+	  controlled over I2C (slave address 0x11).
 
 endif # BACKLIGHT_CLASS_DEVICE
 
