@@ -82,6 +82,16 @@
 	reg = <0x0 0x9d400000 0x0 0x2400000>;
 };
 
+&usb3 {
+    extcon = <&pm660_charger>;
+	vbus_dwc3-supply = <&smb2_vbus>;
+	qcom,no-wakeup-src-in-hostmode;
+	
+	dwc3@a800000 {
+	    usb-phy = <&qusb_phy1>, <&usb_nop_phy>;
+		maximum-speed = "high-speed";     
+};
+
 &soc {
 	cam_front_dvdd_fixed_regulator {
 		compatible = "regulator-fixed";
@@ -92,6 +102,14 @@
 		gpio = <&pm660l_gpios 3 0x0>;
 		vin-supply = <&pm660_s5>;
 	};
+	
+	usb_nop_phy: usb_nop_phy {
+		compatible = "usb-nop-xceiv";
+	};
+};
+
+&pm660_charger {
+    qcom,micro-usb; // Fix usb
 };
 
 &tlmm {

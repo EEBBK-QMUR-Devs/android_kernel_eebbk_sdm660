@@ -36,7 +36,7 @@
 	qcom,mdss-dsi-pan-fps-update = "dfps_immediate_porch_mode_vfp";
 	qcom,mdss-dsi-bl-pmic-pwm-frequency = <200>;
 	qcom,mdss-dsi-bl-pwm-pmi;
-	pwms = <0x24e 0x00 0x00>;
+	pwms = <&pm660l_pwm_4 0x00 0x00>;
 };
 
 &mdss_dsi_active {
@@ -56,5 +56,15 @@
 
 	config {
 		pins = "gpio53", "gpio0", "gpio1";
+	};
+};
+
+&pm660l_pwm_4 {
+	status = "okay";
+	qcom,period = <0x172>;
+	qcom,mode-select = <0>;
+	qcom,pwm {
+		label = "pwm";
+		qcom,duty = <0x5d>;
 	};
 };
