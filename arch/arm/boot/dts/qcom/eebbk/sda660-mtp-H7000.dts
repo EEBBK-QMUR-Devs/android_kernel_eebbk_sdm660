@@ -25,6 +25,23 @@
 	qcom,pmic-id = <0x0001001b 0x0101011a 0x0 0x0>,
 			<0x0001001b 0x0201011a 0x0 0x0>,
 			<0x0001001b 0x0102001a 0x0 0x0>;
+
+	/* ramoops: console 256KB / record 64KB / pmsg 128KB */
+	reserved-memory {
+		ramoops_region: ramoops_region@a0119000 {
+			compatible = "ramoops";
+			no-map;
+			reg = <0x0 0xa0119000 0x0 0xe0000>;
+		};
+	};
+
+	ramoops {
+		compatible = "ramoops";
+		memory-region = <&ramoops_region>;
+		record-size = <0x10000>;
+		console-size = <0x40000>;
+		pmsg-size = <0x20000>;
+	};
 };
 
 &tavil_snd {
