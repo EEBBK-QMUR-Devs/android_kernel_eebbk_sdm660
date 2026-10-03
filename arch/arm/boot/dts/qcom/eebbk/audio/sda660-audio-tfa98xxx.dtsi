@@ -124,3 +124,131 @@
 &tavil_snd {
 	status = "disabled";
 };
+
+
+/*
+ * H7000 音频: 使用 PM660L 内置 codec (int codec)  MI2S1 -> TFA9891 功放,
+ * 禁用以 tasha/wcd9335 为代表的外部 SLIMbus codec 路线 (硬件不存在,
+ * 导致 sound-9335 machine 永远 probe 不到 codec, 声卡不注册)。
+ * 对齐官方 sdm660-internal-codec.dtsi  sdm660-mtp.dts 的 int codec 方案。
+ */
+&slim_aud {
+	status = "disabled";
+};
+
+&dai_slim {
+	status = "disabled";
+};
+
+&wcd9335 {
+	status = "disabled";
+};
+
+&wcd934x_cdc {
+	status = "disabled";
+};
+
+/*
+ * H7000 v64: KEEP THIS ENABLED - it is the root cause of the silent speakers.
+ *
+ * QCOM's reference board file sdm660-internal-codec.dtsi disables this node
+ * (that board has no I2S smart-amp), and the H7000 port copied that. But the
+ * stock h7000.dts leaves audio_ext_clk with no status property, i.e. okay:
+ * this node is the only provider of the LPASS MCLK / "SPEAKER_I2S_OSR" clock
+ * (qcom,codec-mclk-clk-freq = 11289600) and it also programs
+ * qcom,mclk-clk-reg = <0x15020018> and the lpi_mclk0 pinctrl (LPI gpio18).
+ * With it disabled the MI2S internal MCLK is never routed to the TFA9891
+ * amps, so both chips report NOCLK=1 / AREF=0 / CLKS=0, tfaRunStartup() times
+ * out (err 5) after 10 tries and the DSP never cold-boots -> total silence.
+ */
+&clock_audio {
+	status = "okay";
+};
+
+&wcd_rst_gpio {
+	status = "disabled";
+};
+
+&wcd9xxx_intc {
+	status = "disabled";
+};
+
+&tasha_snd {
+	status = "disabled";
+};
+
+&tavil_snd {
+	status = "disabled";
+};
+
+&spi_7 {
+	status = "disabled";
+};
+
+&wdsp_mgr {
+	status = "disabled";
+};
+
+&wdsp_glink {
+	status = "disabled";
+};
+
+&glink_spi_xprt_wdsp {
+	status = "disabled";
+};
+
+&glink_fifo_wdsp {
+	status = "disabled";
+};
+
+&glink_qos_wdsp {
+	status = "disabled";
+};
+
+&int_codec {
+	status = "okay";
+	/* H7000: PM660L analog (INT) codec has no external codec gpios;
+	   sound machine of_get_named_gpio fails without #gpio-cells on
+	   us_euro_gpio / cdc_pdm / cdc_comp / cdc_dmic pinctrl nodes.
+	   Drop the references (same as official QRD int-codec boards). */
+	/delete-property/ qcom,us-euro-gpios;
+	/delete-property/ qcom,cdc-pdm-gpios;
+	/delete-property/ qcom,cdc-comp-gpios;
+	/delete-property/ qcom,cdc-dmic-gpios;
+};
+
+&pmic_analog_codec {
+	status = "okay";
+};
+
+&int_codec {
+	/*
+	 * H7000: no WSA881x soundwire speakers (TFA9891 amps instead).
+	 * Without qcom,wsa-disable, msm_init_wsa_dev() finds 0 of the 2
+	 * configured wsa devices and returns -EPROBE_DEFER forever, so the
+	 * sound card never registers.
+	 */
+	qcom,wsa-disable;
+	/*
+	 * H7000: TFA9891 speaker amps take MCLK from INT_MCLK0 (analog codec
+	 * internal 9.6MHz clock, see audio-routing above). Stock h7000.dts has
+	 * all-zero ext-mclk. v26/v28 kept <0 1 0 0> which routes SEC_MI2S to
+	 * LPASS ext MCLK_1 instead - tfaRunStartup() then reports
+	 * Tfa98xx_Error_NoClock(5) and the speaker never starts. The v27 boot
+	 * hang was the i2c-probe firmware request (reverted in v28), NOT this
+	 * property, so aligning to stock is now safe.
+	 */
+	qcom,msm-mi2s-ext-mclk = <0 0 0 0>;
+	/*
+	 * H7000: SEC_MI2S must be master (LPASS generates BCLK/WS for the
+	 * TFA9891 amps). Stock h7000.dts has qcom,msm-mi2s-master = <0 1 0 0>;
+	 * without it msm_is_mi2s_master[1]=0 and the LPASS waits for an
+	 * external bit clock that never comes -> no BCLK/MCLK on the pins
+	 * (tfa STATUS: AREFS=0 CLKS=0 -> tfaRunStartup err5 NoClock).
+	 */
+	qcom,msm-mi2s-master = <0 1 0 0>;
+};
+
+&msm_sdw_codec {
+	status = "okay";
+};
