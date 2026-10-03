@@ -761,7 +761,15 @@ uint32_t core_set_dolby_manufacturer_id(int manufacturer_id)
 }
 
 int q6core_is_adsp_ready(void)
-{
+{	/*
+	 * H7000: A9-era ADSP firmware does not support the AVCS
+	 * AVCS_CMD_ADSP_EVENT_GET_STATE opcode this kernel uses, so the
+	 * query times out and codec/machine probes defer forever (no
+	 * soundcards). ADSP is PIL-loaded and up, so assume ready.
+	 */
+	return true;
+#if 0
+
 	int rc = 0;
 	int ret = false;
 	struct apr_hdr hdr;
@@ -797,7 +805,9 @@ bail:
 	pr_debug("%s: leave, rc %d, adsp ready %d\n", __func__, rc, ret);
 	mutex_unlock(&(q6core_lcl.cmd_lock));
 	return ret;
+#endif
 }
+
 
 
 static int q6core_map_memory_regions(phys_addr_t *buf_add, uint32_t mempool_id,
