@@ -93,7 +93,7 @@ static int tfa98xx_mixer_profile; /* HTC_AUDIO: bypass profile */
 static char *dflt_prof_name = "";
 module_param(dflt_prof_name, charp, S_IRUGO);
 
-static int no_start;
+int no_start; /* non-static: tfa_dsp.c (tfaRunColdStartup) checks it too */
 module_param(no_start, int, S_IRUGO);
 MODULE_PARM_DESC(no_start, "do not start the work queue; for debugging via user\n");
 
@@ -1701,13 +1701,30 @@ enum Tfa98xx_Error tfa98xx_write_register16(Tfa98xx_handle_t handle,
 
 	if (tfa98xx_devices[handle]) {
 		tfa98xx = tfa98xx_devices[handle];
-		if (!tfa98xx || !tfa98xx->regmap) {
-			pr_err("No tfa98xx regmap available\n");
+		if (!tfa98xx || !tfa98xx->i2c) {
+			pr_err("No tfa98xx i2c available\n");
 			return Tfa98xx_Error_Bad_Parameter;
 		}
 retry:
-		ret = regmap_write(tfa98xx->regmap, subaddress, value);
-		if (ret < 0) {
+		/* H7000 v68: raw i2c write, but BIG endian - the TFA9891 expects
+		 * the 16-bit value MSB first ([reg][hi][lo]).  The v20 version
+		 * of this hack sent [reg][lo][hi], i.e. every register value
+		 * was byte-swapped, while reads (below) go through regmap,
+		 * which for an i2c device defaults to big-endian.  The chip
+		 * therefore never received a usable configuration: the PLL
+		 * could not lock and STATUS stayed at 0x0a1d with
+		 * CLKS=0/AREFS=0, so tfaRunStartup() timed out (err 5) and the
+		 * DSP never cold-booted.  v16 - the last build with sound -
+		 * used regmap_write(), i.e. big-endian. */
+		{
+			u8 buf[3];
+
+			buf[0] = subaddress;
+			buf[1] = (value >> 8) & 0xff;
+			buf[2] = value & 0xff;
+			ret = i2c_master_send(tfa98xx->i2c, buf, 3);
+		}
+		if (ret != 3) {
 			pr_warn("i2c error, retries left: %d\n", retries);
 			if (retries) {
 				retries--;
@@ -2112,7 +2129,7 @@ static void tfa98xx_interrupt_enable(struct tfa98xx *tfa98xx, bool enable)
  * FIXME: may need to review that (one per instance of codec device?)
  */
 
-static char *fw_name = "Tfa98xx.cnt";
+static char *fw_name = "tfa98xx.cnt";
 static nxpTfaContainer_t *container;
 
 static void tfa98xx_container_loaded(const struct firmware *cont, void *context)
@@ -2158,48 +2175,69 @@ static void tfa98xx_container_loaded(const struct firmware *cont, void *context)
 		return;
 	}
 
+	if (no_start != 1) {
+		/* Full DSP cold-start path (NOT used on H7000: no usable
+		 * MCLK - A9 ADSP rejects AFE clock cmds, cold-boot then
+		 * hangs the chip with I2C NAK / err107). */
 /* HTC_AUD_START - pass upper-spk information to tfa_dsp */
 #if 0
-	if (tfa_probe(tfa98xx->i2c->addr << 1, &handle) != Tfa98xx_Error_Ok) {
+		if (tfa_probe(tfa98xx->i2c->addr << 1, &handle) != Tfa98xx_Error_Ok) {
 #else
-	if (tfa_probe(tfa98xx->upper_spk,
-		      tfa98xx->i2c->addr << 1,
-		      &handle) != Tfa98xx_Error_Ok) {
+		if (tfa_probe(tfa98xx->upper_spk,
+			      tfa98xx->i2c->addr << 1,
+			      &handle) != Tfa98xx_Error_Ok) {
 #endif
 /* HTC_AUD_END */
-		dev_err(tfa98xx->dev, "Failed to probe TFA98xx @ 0x%.2x\n",
-				tfa98xx->i2c->addr);
-		return;
-	}
-
-	/* prefix is the application name from the cnt */
-	tfa_cnt_get_app_name(tfa98xx->fw.name);
-
-	/* Override default profile if requested */
-	if (strcmp(dflt_prof_name, "")) {
-		unsigned int i;
-
-		for (i = 0; i < tfaContMaxProfile(tfa98xx->handle); i++) {
-			if (strcmp(tfaContProfileName(tfa98xx->handle, i),
-				   dflt_prof_name) == 0) {
-				tfa98xx_profile = i;
-				dev_info(tfa98xx->dev, "changing default profile to %s (%d)\n",
-						dflt_prof_name,
-						tfa98xx_profile);
-				break;
-			}
+			dev_err(tfa98xx->dev, "Failed to probe TFA98xx @ 0x%.2x\n",
+					tfa98xx->i2c->addr);
+			return;
 		}
-		if (i >= tfaContMaxProfile(tfa98xx->handle))
-			dev_info(tfa98xx->dev,
-					"Default profile override failed (%s profile not found)\n",
-					dflt_prof_name);
-	}
 
-	tfa98xx->dsp_fw_state = TFA98XX_DSP_FW_OK;
-	pr_debug("Firmware init complete\n");
+		/* prefix is the application name from the cnt */
+		tfa_cnt_get_app_name(tfa98xx->fw.name);
 
-	if (no_start == 1)
+		/* Override default profile if requested */
+		if (strcmp(dflt_prof_name, "")) {
+			unsigned int i;
+
+			for (i = 0; i < tfaContMaxProfile(tfa98xx->handle); i++) {
+				if (strcmp(tfaContProfileName(tfa98xx->handle, i),
+					   dflt_prof_name) == 0) {
+					tfa98xx_profile = i;
+					dev_info(tfa98xx->dev, "changing default profile to %s (%d)\n",
+							dflt_prof_name,
+							tfa98xx_profile);
+					break;
+				}
+			}
+			if (i >= tfaContMaxProfile(tfa98xx->handle))
+				dev_info(tfa98xx->dev,
+						"Default profile override failed (%s profile not found)\n",
+						dflt_prof_name);
+		}
+
+		tfa98xx->dsp_fw_state = TFA98XX_DSP_FW_OK;
+		pr_debug("Firmware init complete\n");
+	} else {
+		/* H7000 v21: NEVER run tfa_probe - its init sequence
+		 * writes the .cnt config into the chip and rewrites
+		 * I2SREG 0x808b (factory) -> 0x9380. The 0x05 high byte
+		 * is read-only from I2C (only the DSP can set it), so
+		 * once changed the factory I2S passthrough state that
+		 * produced the audible v16 boot tone can never be
+		 * restored. Keep the chip in factory state and just
+		 * enable the amp, raw i2c [reg][lo][hi]:
+		 * AUDIO_CTR CFSM=0 + SYS_CTRL AMPE|DCA, then stop -
+		 * never cold-start. */
+		{
+			u8 b1[3] = {0x06, 0x10, 0x00}; /* AUDIO_CTR: CFSM=0 */
+			u8 b2[3] = {0x09, 0x18, 0x00}; /* SYS_CTRL: AMPE|DCA */
+			i2c_master_send(tfa98xx->i2c, b1, 3);
+			i2c_master_send(tfa98xx->i2c, b2, 3);
+		}
+		tfa98xx->dsp_fw_state = TFA98XX_DSP_FW_FAIL;
 		return;
+	}
 
 	/* Only controls for master device */
 	if (tfa98xx->handle == 0)
@@ -2593,6 +2631,18 @@ static int tfa98xx_prepare(struct snd_pcm_substream *substream,
 	struct tfa98xx *tfa98xx = snd_soc_codec_get_drvdata(codec);
 
 	pr_info("%s: trigger tfa_start\n", __func__);
+	if (no_start == 1) {
+		/* H7000 v22: run the FULL tfa_start init path - this is
+		 * exactly the configuration (tfaRunStartup: I2S + device +
+		 * profile registers + PLL) that produced the audible v16
+		 * boot tone. tfaRunColdStartup early-returns before
+		 * tfaRunColdboot (no usable MCLK on this board: cold-boot
+		 * hangs the chip with I2C NAK / err107). */
+		mutex_lock(&tfa98xx->dsp_lock);
+		tfa98xx_tfa_start(tfa98xx, tfa98xx_profile, tfa98xx_vsteps);
+		mutex_unlock(&tfa98xx->dsp_lock);
+		return 0;
+	}
 	cancel_delayed_work_sync(&tfa98xx->init_work);
 	queue_delayed_work(tfa98xx->tfa98xx_wq, &tfa98xx->init_work, 0);
 	return 0;
@@ -2681,20 +2731,23 @@ static int tfa98xx_hw_params(struct snd_pcm_substream *substream,
 			snd_pcm_format_physical_width(params_format(params)));
 
 	/* check if samplerate is supported for this mixer profile */
-	prof_idx = get_profile_id_for_sr(tfa98xx_mixer_profile, rate);
-	if (prof_idx < 0) {
-		pr_err("tfa98xx: invalid sample rate %d.\n", rate);
-		return -EINVAL;
+	if (no_start != 1) { /* bypass mode: no DSP profiles, accept any rate */
+		prof_idx = get_profile_id_for_sr(tfa98xx_mixer_profile, rate);
+		if (prof_idx < 0) {
+			pr_err("tfa98xx: invalid sample rate %d.\n", rate);
+			return -EINVAL;
+		}
+		pr_debug("mixer profile:container profile = [%d:%d]\n",
+				tfa98xx_mixer_profile, prof_idx);
 	}
-	pr_debug("mixer profile:container profile = [%d:%d]\n",
-			tfa98xx_mixer_profile, prof_idx);
 
 	if (params_channels(params) > 2)
 		pr_warn("Unusual number of channels: %d\n",
 				params_channels(params));
 
 	/* update 'real' profile (container profile) */
-	tfa98xx_profile = prof_idx;
+	if (no_start != 1)
+		tfa98xx_profile = prof_idx;
 
 	/* update to new rate */
 	tfa98xx->rate = rate;
@@ -2833,6 +2886,9 @@ static const struct regmap_config tfa98xx_regmap = {
 	.readable_reg = tfa98xx_readable_register,
 	.volatile_reg = tfa98xx_volatile_register,
 	.cache_type = REGCACHE_NONE,
+	/* H7000 v68: the TFA9891 is big-endian on the wire; state it
+	 * explicitly instead of relying on the i2c default. */
+	.val_format_endian = REGMAP_ENDIAN_BIG,
 };
 
 static void tfa98xx_irq_9888(struct tfa98xx *tfa98xx)
@@ -3125,8 +3181,12 @@ static int tfa98xx_i2c_probe(struct i2c_client *i2c,
 			goto err;
 	}
 
-	/* Power up! */
-	tfa98xx_ext_reset(tfa98xx);
+	/* Power up! H7000: NEVER HW-reset the TFA. A GPIO reset re-runs
+	 * the speaker CF calibration which fails (no AFE MCLK on A9 ADSP)
+	 * and latches SPKS=1, disabling the amp -> no sound. The chip is
+	 * factory-clean on POR; tfaRunStartup() initializes it over I2C. */
+	if (0)
+		tfa98xx_ext_reset(tfa98xx);
 
 	if (no_start == 0) {
 		ret = regmap_read(tfa98xx->regmap, 0x03, &reg);
@@ -3187,6 +3247,19 @@ static int tfa98xx_i2c_probe(struct i2c_client *i2c,
 		goto err_off;
 	}
 
+	if (no_start == 1) {
+		/* H7000 factory I2S pass-through: enable the amp without
+		 * ever starting the DSP. AUDIO_CTR VOL=48 + SYS_CTRL
+		 * AMPE|DCA. Chip is factory-clean on POR (SPKS=0) so the
+		 * amp closes and I2S data passes straight through
+		 * (verified: boot tone plays; v16's DSP cold-start NAKs
+		 * the chip -> err107 -> silence, so never cold-start).
+		 * regmap is reg_bits=8/val_bits=16 == i2cset -w. */
+		regmap_write(tfa98xx->regmap, 0x06, 0x0030); /* AUDIO_CTR: VOL=48, CFSM=0 */
+		regmap_write(tfa98xx->regmap, 0x09, 0x0018); /* SYS_CTRL: AMPE|DCA, PWDN=0 */
+		pr_info("tfa98xx: no_start amp enable (VOL=48, AMPE+DCA)\n");
+	}
+
 	if (gpio_is_valid(tfa98xx->irq_gpio)
 			&& !(tfa98xx->flags & TFA98XX_FLAG_SKIP_INTERRUPTS)) {
 		/* register irq handler */
@@ -3219,6 +3292,13 @@ static int tfa98xx_i2c_probe(struct i2c_client *i2c,
 		dev_info(&i2c->dev, "error creating sysfs files\n");
 
 	pr_info("%s Probe completed successfully!\n", __func__);
+
+	/* H7000 v63 evidence: log actual reset-gpio level (high-active RST,
+	 * so 0 = released/running, 1 = in reset) */
+	if (gpio_is_valid(tfa98xx->reset_gpio))
+		dev_info(&i2c->dev, "H7000 reset gpio %d val=%d\n",
+			 tfa98xx->reset_gpio,
+			 gpio_get_value(tfa98xx->reset_gpio));
 
 	return 0;
 

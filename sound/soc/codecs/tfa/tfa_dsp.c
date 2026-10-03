@@ -355,7 +355,8 @@ enum Tfa98xx_Error tfa_probe(bool upper_spk, unsigned char slave_address,
 #ifdef __KERNEL__ /* don't spam userspace with information */
 		tfa98xx_trace_printk("slave:0x%02x revid:0x%04x\n",
 			slave_address, rev);
-		pr_debug("slave:0x%02x revid:0x%04x\n", slave_address, rev);
+		pr_info("tfa98xx slave:0x%02x revid:0x%04x (revlo:0x%02x)\n",
+			slave_address, rev, rev & 0xff);
 #endif
 		break;
 	default:
@@ -667,6 +668,10 @@ static enum Tfa98xx_Error _tfa98xx_dsp_system_stable(Tfa98xx_handle_t handle,
 	/* check AREFS and CLKS: not ready if either is clear */
 	*ready = !((TFA_GET_BF_VALUE(handle, AREFS, status) == 0)
 			|| (TFA_GET_BF_VALUE(handle, CLKS, status) == 0));
+	if (!*ready)
+		pr_info("H7000 tfa not-stable: status=%04x arefs=%d clks=%d\n",
+			status, TFA_GET_BF_VALUE(handle, AREFS, status),
+			TFA_GET_BF_VALUE(handle, CLKS, status));
 
 	return error;
 }
@@ -1203,20 +1208,28 @@ static enum Tfa98xx_Error tfa98xx_check_ic_rom_version(Tfa98xx_handle_t handle,
 	lsb_revid = handles_local[handle].rev & 0xff;
 	/* only compare lower byte */
 
-	if ((checkrev != 0xFF) && (checkrev != lsb_revid))
+	if ((checkrev != 0xFF) && (checkrev != lsb_revid)) {
+		pr_err("patch rev check failed: checkrev=0x%02x chip=0x%02x\n",
+			checkrev, lsb_revid);
 		return Tfa98xx_Error_Not_Supported;
+	}
 
 	checkaddress = (patchheader[1] << 8) + patchheader[2];
 	checkvalue = (patchheader[3] << 16) + (patchheader[4] << 8)
 			+ patchheader[5];
 	if (checkaddress != 0xFFFF) {
+		pr_info("patch xmem check: addr=0x%04x expect=0x%06x\n",
+			checkaddress, checkvalue);
 		/* before reading XMEM, check if we can access the DSP */
 		error = tfa98xx_dsp_system_stable(handle, &status);
 		if (error == Tfa98xx_Error_Ok) {
 			if (!status) {
 				/* DSP subsys not running */
+				pr_err("patch xmem check: DSP not running\n");
 				error = Tfa98xx_Error_DSP_not_running;
 			}
+		} else {
+			pr_err("patch xmem check: system_stable err %d\n", error);
 		}
 		/* read register to check the correct ROM version */
 		if (error == Tfa98xx_Error_Ok)
@@ -1232,7 +1245,11 @@ static enum Tfa98xx_Error tfa98xx_check_ic_rom_version(Tfa98xx_handle_t handle,
 						value,
 						checkvalue);
 				error = Tfa98xx_Error_Not_Supported;
+			} else {
+				pr_info("patch xmem check OK: value=0x%x\n", value);
 			}
+		} else {
+			pr_err("patch xmem check: dsp_read_mem err %d\n", error);
 		}
 	} else { /* == 0xffff */
 		/* check if the revid subtype is in there */
@@ -2534,7 +2551,11 @@ static enum Tfa98xx_Error tfa98xx_aec_output(Tfa98xx_handle_t handle,
 		Tfa98xx_DAI_TDM) == Tfa98xx_DAI_TDM)
 		return err;
 
-	if (tfa98xx_dev_family(handle) == 1)
+	/* TFA9891 (rev 0x92) is TFA1; also treat family 0 (container
+	 * device whose tfa_probe() has not run yet) as TFA1 instead of
+	 * failing with Not_Supported (err 107). */
+	if (tfa98xx_dev_family(handle) == 1 ||
+	    tfa98xx_dev_family(handle) == 0)
 		err = -tfa_set_bf(handle, TFA1_BF_I2SDOE, (enable != 0));
 	else {
 		pr_err("I2SDOE on unsupported family\n");
@@ -2626,6 +2647,8 @@ enum Tfa98xx_Error tfaRunSpeakerBoost(Tfa98xx_handle_t handle, int force,
 	}
 
 	value = TFA_GET_BF(handle, ACS);
+	pr_info("tfaRunSpeakerBoost: ACS=%d force=%d profile=%d\n",
+		value, force, profile);
 
 #ifdef __KERNEL__ /* TODO try to combine this with the pr_debug below */
 	tfa98xx_trace_printk("%s %sstart\n",
@@ -2676,6 +2699,7 @@ enum Tfa98xx_Error tfaRunSpeakerStartup(Tfa98xx_handle_t handle, int force,
 
 	if (!force) { /* in case of force CF already runnning */
 		err = tfaRunStartup(handle, profile);
+		pr_info("tfaRunSpeakerStartup: tfaRunStartup ret %d\n", err);
 		PRINT_ASSERT(err);
 		if (err)
 			return err;
@@ -2684,6 +2708,7 @@ enum Tfa98xx_Error tfaRunSpeakerStartup(Tfa98xx_handle_t handle, int force,
 			return err;
 
 		err = tfaRunStartDSP(handle);
+		pr_info("tfaRunSpeakerStartup: tfaRunStartDSP ret %d\n", err);
 		if (err)
 			return err;
 	}
@@ -2833,6 +2858,7 @@ enum Tfa98xx_Error tfaRunStartDSP(Tfa98xx_handle_t handle)
 
 	err = tfa_run_load_patch(handle);
 	if (err) { /* patch load is fatal so return immediately*/
+		pr_err("tfaRunStartDSP: load_patch failed %d\n", err);
 		return err;
 	}
 
@@ -2946,11 +2972,23 @@ enum Tfa98xx_Error tfaRunStartup(Tfa98xx_handle_t handle, int profile)
 enum Tfa98xx_Error tfaRunColdStartup(Tfa98xx_handle_t handle, int profile)
 {
 	enum Tfa98xx_Error err = Tfa98xx_Error_Ok;
+	extern int no_start; /* module_param in tfa98xx.c */
 
 	err = tfaRunStartup(handle, profile);
 	PRINT_ASSERT(err);
 	if (err)
 		return err;
+
+	if (no_start) {
+		/* H7000 v22: tfaRunStartup did the full I2S + device +
+		 * profile register init + PLL wait - this is the exact
+		 * chip state that produced the audible v16 boot tone.
+		 * NEVER cold-boot from here: no usable MCLK on this
+		 * board, tfaRunColdboot hangs the chip with I2C NAK
+		 * (err107) and destroys the working passthrough. Return
+		 * Ok, caller (tfa_start) continues to unmute. */
+		return err;
+	}
 
 	/* force cold boot */
 	err = tfaRunColdboot(handle, 1); /* set ACS */
@@ -3136,6 +3174,7 @@ enum tfa_error tfa_start(int next_profile, int *vstep)
 		pr_err("No or wrong container file loaded\n");
 		return tfa_error_bad_param;
 	}
+	pr_info("tfa_start: devcount=%d\n", devcount);
 
 	for (dev = 0; dev < devcount; dev++) {
 		/* HTC_AUD_START - Turn off Bottom SPK in Receiver mode */
@@ -3148,9 +3187,20 @@ enum tfa_error tfa_start(int next_profile, int *vstep)
 		}
 		/* HTC_AUD_END */
 
+		/* H7000: skip devices whose tfa_probe() never ran (e.g.
+		 * 2-0035 not bound by the machine driver). Their family is
+		 * still 0 -> aec_output() would fail with err 107 and abort
+		 * the whole startup. */
+		if (tfa98xx_dev_family(dev) == 0) {
+			pr_info("tfa_start: skip uninitialized dev %d\n", dev);
+			continue;
+		}
+
 		err = tfaContOpen(dev);
-		if (err != Tfa98xx_Error_Ok)
+		if (err != Tfa98xx_Error_Ok) {
+			pr_err("tfa_start: tfaContOpen failed %d\n", err);
 			goto error_exit;
+		}
 
 		/* Get currentprofile */
 		active_profile = tfa_get_swprof(dev);
@@ -3184,13 +3234,18 @@ enum tfa_error tfa_start(int next_profile, int *vstep)
 
 		/* enable I2S output on TFA1 devices without TDM */
 		err = tfa98xx_aec_output(dev, 1);
-		if (err != Tfa98xx_Error_Ok)
+		if (err != Tfa98xx_Error_Ok) {
+			pr_err("tfa_start: aec_output failed %d\n", err);
 			goto error_exit;
+		}
 
 		/* Check if we need coldstart or ACS is set */
 		err = tfaRunSpeakerBoost(dev, 0, next_profile);
-		if (err != Tfa98xx_Error_Ok)
+		if (err != Tfa98xx_Error_Ok) {
+			pr_err("tfa_start: tfaRunSpeakerBoost failed %d (ACS=%d)\n",
+				err, TFA_GET_BF(dev, ACS));
 			goto error_exit;
+		}
 
 		active_profile = tfa_get_swprof(dev);
 
@@ -3211,6 +3266,13 @@ enum tfa_error tfa_start(int next_profile, int *vstep)
 			     strlen("receiver")) &&
 		    handles_local[dev].upper_spk == false)
 			continue;
+
+		/* H7000: skip devices whose tfa_probe() never ran */
+		if (tfa98xx_dev_family(dev) == 0) {
+			pr_info("tfa_start: skip uninitialized dev %d (2nd pass)\n",
+				dev);
+			continue;
+		}
 
 		/* check if the profile and steps are the one we want */
 		/* was it not done already */
