@@ -492,16 +492,27 @@ static int audio_ref_clk_probe(struct platform_device *pdev)
 	if (clk_gpio > 0) {
 		ret = gpio_request(clk_gpio, "EXT_CLK");
 		if (ret) {
-			dev_err(&pdev->dev,
-				"Request ext clk gpio failed %d, err:%d\n",
+			/*
+			 * H7000 v64: do not abort the probe here. This GPIO only
+			 * drives the PMI/AP reference clocks, which nothing on
+			 * this board consumes; aborting also skipped registering
+			 * the LPASS MCLK ("SPEAKER_I2S_OSR") clock that feeds the
+			 * TFA9891 amplifiers - the exact clock whose absence
+			 * keeps both speakers silent. The referenced PM660 GPIO
+			 * is not even exposed by the PM660 gpiochip on this
+			 * board (ngpio = 3), so keep probing without it.
+			 */
+			dev_warn(&pdev->dev,
+				"Request ext clk gpio %d failed, err:%d (continuing)\n",
 				clk_gpio, ret);
-			goto err;
-		}
-		if (of_property_read_bool(pdev->dev.of_node,
+			audio_pmi_clk.gpio = -1;
+			audio_ap_clk.gpio = -1;
+		} else if (of_property_read_bool(pdev->dev.of_node,
 					"qcom,node_has_rpm_clock")) {
 			audio_pmi_clk.gpio = clk_gpio;
-		} else
+		} else {
 			audio_ap_clk.gpio = clk_gpio;
+		}
 
 	}
 
@@ -524,7 +535,19 @@ static int audio_ref_clk_probe(struct platform_device *pdev)
 
 	clk_gpio = of_get_named_gpio(pdev->dev.of_node,
 				     "qcom,audio-ref-clk-gpio", 0);
-	if (clk_gpio > 0) {
+	/*
+	 * H7000 v64: register the full reference-clock set (which contains
+	 * "audio_lpass_mclk" - the LPASS MCLK / SPEAKER_I2S_OSR clock that
+	 * feeds the TFA9891 amplifiers) whenever this node declares a
+	 * reference-clock GPIO, even when that GPIO cannot be resolved on this
+	 * board: the PM660 gpiochip only exposes 3 pins here, so
+	 * of_get_named_gpio() may fail although the audio clock wiring is
+	 * intact.  Only the separate audio_ext_clk_lnbb node - which has no
+	 * such property - falls back to the single LNBB clock.
+	 */
+	if (clk_gpio > 0 ||
+	    of_find_property(pdev->dev.of_node, "qcom,audio-ref-clk-gpio",
+			     NULL)) {
 		for (i = 0; i < ARRAY_SIZE(audio_msm_hws); i++) {
 			audio_clk = devm_clk_register(dev, audio_msm_hws[i]);
 			if (IS_ERR(audio_clk)) {

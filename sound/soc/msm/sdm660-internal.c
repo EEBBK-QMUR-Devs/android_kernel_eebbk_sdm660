@@ -1263,10 +1263,44 @@ static int msm_int_mi2s_snd_startup(struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
 	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
-	struct snd_soc_codec *codec = rtd->codec_dais[ANA_CDC]->codec;
+	struct snd_soc_codec *codec = NULL;
 	int ret = 0;
 	struct msm_asoc_mach_data *pdata = NULL;
 
+	/* H7000 v55: SEC_MI2S BE registers tfa98xx as codecs[0] only, so
+	 * codec_dais[ANA_CDC] may be out of range / NULL for this link.
+	 * Use it when valid, else fall back to the pmic-analog-codec
+	 * found by compatible (stock machine fills ANA_CDC only for
+	 * INT0-3 MI2S links). */
+	if (rtd->num_codecs > ANA_CDC)
+		codec = rtd->codec_dais[ANA_CDC]->codec;
+	dev_info(rtd->card->dev, "%s: H7000 enter link=%s codec=%p\n",
+		 __func__, rtd->dai_link->name ? rtd->dai_link->name : "?",
+		 codec);
+	if (!codec) {
+		struct device_node *np =
+			of_find_compatible_node(NULL, NULL,
+					       "qcom,pmic-analog-codec");
+		if (np) {
+			struct snd_soc_codec *c;
+			list_for_each_entry(c, &rtd->card->codec_dev_list,
+					    card_list) {
+				if (c->component.dev &&
+				    c->component.dev->of_node == np) {
+					codec = c;
+					break;
+				}
+			}
+		}
+		dev_info(rtd->card->dev, "%s: H7000 fallback anlg=%p\n",
+			 __func__, codec);
+	}
+	if (!codec) {
+		dev_info(rtd->card->dev,
+			 "%s: H7000 analog codec not found, skip MCLK\n",
+			 __func__);
+		return -EINVAL;
+	}
 	pdata = snd_soc_card_get_drvdata(codec->component.card);
 	pr_debug("%s(): substream = %s  stream = %d\n", __func__,
 		 substream->name, substream->stream);
@@ -1277,6 +1311,35 @@ static int msm_int_mi2s_snd_startup(struct snd_pcm_substream *substream)
 				__func__, ret);
 		return ret;
 	}
+	/* H7000 v55: the two TFA9891 speaker amps take their MCLK from
+	 * INT_MCLK0 (PM660L analog-codec internal 9.6MHz clock).  The
+	 * SEC_MI2S BE dai link registers tfa98xx as codecs[0], so DAPM
+	 * never walks through the analog-codec INT_MCLK0 supply during
+	 * SEC playback and the MCLK pin never toggles (TFA STATUS:
+	 * AREFS=0 CLKS=0).  Mirror the stock msm_int_mclk0_event()
+	 * sequence here, scoped to SEC_MI2S_RX only.  We deliberately do
+	 * NOT start the INT0 AFE port (the v44/v45 900E hang came from
+	 * doing that unconditionally inside the shared q6 dai prepare
+	 * for every MI2S port). */
+	if (rtd->dai_link->name &&
+	    !strcmp(rtd->dai_link->name, LPASS_BE_SEC_MI2S_RX)) {
+		struct msm_asoc_mach_data *p =
+			snd_soc_card_get_drvdata(codec->component.card);
+
+		if (p) {
+			ret = msm_int_enable_dig_cdc_clk(codec, 1, true);
+			dev_info(rtd->card->dev,
+				 "%s: H7000 INT_MCLK0(INT0) enable ret %d\n",
+				 __func__, ret);
+			ret = msm_anlg_cdc_mclk_enable(codec, 1, true);
+			dev_info(rtd->card->dev,
+				 "%s: H7000 anlg mclk enable ret %d\n",
+				 __func__, ret);
+		} else {
+			dev_info(rtd->card->dev,
+				 "%s: H7000 pdata unavailable\n", __func__);
+		}
+	}
 	ret = snd_soc_dai_set_fmt(cpu_dai, SND_SOC_DAIFMT_CBS_CFS);
 	if (ret < 0)
 		pr_err("%s: set fmt cpu dai failed; ret=%d\n", __func__, ret);
@@ -1286,6 +1349,8 @@ static int msm_int_mi2s_snd_startup(struct snd_pcm_substream *substream)
 
 static void msm_int_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 {
+	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	struct snd_soc_codec *codec = NULL;
 	int ret;
 
 	pr_debug("%s(): substream = %s  stream = %d\n", __func__,
@@ -1295,6 +1360,19 @@ static void msm_int_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 	if (ret < 0)
 		pr_err("%s:clock disable failed; ret=%d\n", __func__,
 				ret);
+	/* H7000 v55: release INT_MCLK0 when SEC playback stops */
+	if (rtd && rtd->dai_link &&
+	    rtd->dai_link->name &&
+	    !strcmp(rtd->dai_link->name, LPASS_BE_SEC_MI2S_RX)) {
+		if (rtd->num_codecs > ANA_CDC)
+			codec = rtd->codec_dais[ANA_CDC]->codec;
+		if (codec) {
+			msm_anlg_cdc_mclk_enable(codec, 0, true);
+			msm_int_enable_dig_cdc_clk(codec, 0, true);
+			dev_info(rtd->card->dev,
+				 "%s: H7000 INT_MCLK0 released\n", __func__);
+		}
+	}
 }
 
 static void *def_msm_int_wcd_mbhc_cal(void)
@@ -2755,6 +2833,19 @@ static struct snd_soc_dai_link msm_int_be_dai[] = {
 	},
 };
 
+/* H7000: both TFA9891 amplifiers are on the same SEC MI2S bus (2-0034 is the
+ * right/master amp, 2-0035 the left one).  A DAI link takes a list of codecs,
+ * so name both of them.  With only 2-0034 listed, the second codec never ran
+ * its DAI startup, so tfa98xx_startup() - which loads the .cnt configuration
+ * and runs tfa_probe() - never executed for 2-0035.  tfa_start() then had to
+ * skip it ("skip uninitialized dev 1", family still 0) and the left speaker
+ * stayed silent.  The DAI names are built by the codec driver as
+ * "tfa98xx-aif-<i2cbus>-<addr>". */
+static struct snd_soc_dai_link_component msm_sec_mi2s_rx_codecs[] = {
+	{ .name = "tfa98xx.2-0034", .dai_name = "tfa98xx-aif-2-34" },
+	{ .name = "tfa98xx.2-0035", .dai_name = "tfa98xx-aif-2-35" },
+};
+
 static struct snd_soc_dai_link msm_mi2s_be_dai_links[] = {
 	{
 		.name = LPASS_BE_PRI_MI2S_RX,
@@ -2790,8 +2881,9 @@ static struct snd_soc_dai_link msm_mi2s_be_dai_links[] = {
 		.stream_name = "Secondary MI2S Playback",
 		.cpu_dai_name = "msm-dai-q6-mi2s.1",
 		.platform_name = "msm-pcm-routing",
-		.codec_name = "msm-stub-codec.1",
-		.codec_dai_name = "msm-stub-rx",
+		/* both TFA9891 amps (right + left) share this MI2S */
+		.num_codecs = ARRAY_SIZE(msm_sec_mi2s_rx_codecs),
+		.codecs = msm_sec_mi2s_rx_codecs,
 		.no_pcm = 1,
 		.dpcm_playback = 1,
 		.be_id = MSM_BACKEND_DAI_SECONDARY_MI2S_RX,

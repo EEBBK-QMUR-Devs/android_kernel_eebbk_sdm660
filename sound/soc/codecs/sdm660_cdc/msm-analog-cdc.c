@@ -4574,8 +4574,13 @@ static int msm_anlg_cdc_probe(struct platform_device *pdev)
 	int adsp_state;
 
 	adsp_state = apr_get_subsys_state();
-	if (adsp_state != APR_SUBSYS_LOADED ||
-		!q6core_is_adsp_ready()) {
+	/*
+	 * H7000: A9-era ADSP firmware never brings the APR subsystem
+	 * state machine up (no AVCS support), so apr_get_subsys_state()
+	 * stays 0 forever even though ADSP is PIL-loaded. Rely on
+	 * q6core_is_adsp_ready (already workaround'd to true) only.
+	 */
+	if (!q6core_is_adsp_ready()) {
 		dev_err(&pdev->dev, "Adsp is not loaded yet %d\n",
 			adsp_state);
 		return -EPROBE_DEFER;

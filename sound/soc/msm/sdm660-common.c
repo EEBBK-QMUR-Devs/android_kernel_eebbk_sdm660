@@ -12,6 +12,8 @@
 
 #include <linux/input.h>
 #include <linux/of_gpio.h>
+#include <linux/io.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/mfd/msm-cdc-pinctrl.h>
 #include <sound/pcm_params.h>
 #include <sound/q6afe-v2.h>
@@ -2524,6 +2526,11 @@ int msm_mi2s_snd_startup(struct snd_pcm_substream *substream)
 	int port_id = msm_get_port_id(rtd->dai_link->be_id);
 	int index = cpu_dai->id;
 	unsigned int fmt = SND_SOC_DAIFMT_CBS_CFS;
+	struct pinctrl *mi2s_pinctrl;
+	struct pinctrl_state *mi2s_pinctrl_state;
+
+	pr_info("%s: entering, stream=%d dai=%s id=%d\n", __func__,
+		substream->stream, cpu_dai->name, cpu_dai->id);
 
 	dev_dbg(rtd->card->dev,
 		"%s: substream = %s  stream = %d, dai name %s, dai ID %d\n",
@@ -2544,11 +2551,75 @@ int msm_mi2s_snd_startup(struct snd_pcm_substream *substream)
 	 */
 	mutex_lock(&mi2s_intf_conf[index].lock);
 	if (++mi2s_intf_conf[index].ref_cnt == 1) {
+		/* H7000: SEC_MI2S BCLK/WS + SD0/SD1 pinmux is declared in the
+		 * dai_mi2s1 DT node but never selected by any driver on this
+		 * port - without it the TFA9891 amps get no I2S clock (err5
+		 * NoClock / CLKS=0). Explicitly select the default state
+		 * (sec_mi2s_active + sd0/sd1 active) on first open. */
+		mi2s_pinctrl = devm_pinctrl_get(cpu_dai->dev);
+		if (IS_ERR(mi2s_pinctrl)) {
+			dev_err(rtd->card->dev,
+				"%s: devm_pinctrl_get failed (%ld)\n",
+				__func__, PTR_ERR(mi2s_pinctrl));
+		} else {
+			mi2s_pinctrl_state = pinctrl_lookup_state(
+					mi2s_pinctrl, PINCTRL_STATE_DEFAULT);
+			if (IS_ERR(mi2s_pinctrl_state)) {
+				dev_err(rtd->card->dev,
+					"%s: pinctrl_lookup_state default failed (%ld)\n",
+					__func__,
+					PTR_ERR(mi2s_pinctrl_state));
+			} else {
+				ret = pinctrl_select_state(mi2s_pinctrl,
+							   mi2s_pinctrl_state);
+				if (ret)
+					dev_err(rtd->card->dev,
+						"%s: pinctrl_select_state default failed (%d)\n",
+						__func__, ret);
+				else
+					pr_info("%s: MI2S(%d) pinctrl default selected\n",
+						__func__, index);
+			}
+		}
+		/* H7000: the sdm660 pinctrl driver's dt_node_to_map only
+		 * parses config (pinconf_generic), never mux/function, so
+		 * pinctrl_select_state() above leaves BCLK/WS/SD pins in
+		 * gpio mode -> TFA9891 gets no I2S clock (err5 NoClock).
+		 * Write the SEC_MI2S mux values directly into TLMM:
+		 * gpio24/25 = funcs[3] (sec_mi2s), gpio26 = funcs[4],
+		 * gpio27 = funcs[5]; mux bit=2. */
+		if (index == SEC_MI2S) {
+			static const u32 sec_mux[] = { 3, 3, 4, 5 };
+			void __iomem *tlmm = ioremap(0x3918000, 0x4000);
+			int m;
+			if (tlmm) {
+				for (m = 0; m < 4; m++) {
+					u32 v = readl(tlmm + m * 0x1000);
+					v = (v & ~(0x7 << 2)) |
+						(sec_mux[m] << 2);
+					writel(v, tlmm + m * 0x1000);
+				}
+				for (m = 0; m < 4; m++)
+					pr_info("%s: H7000 pin%d ctl_reg=0x%x after write\n",
+						__func__, 24 + m,
+						readl(tlmm + m * 0x1000));
+				iounmap(tlmm);
+				pr_info("%s: H7000 SEC_MI2S mux written (gpio24-27)\n",
+					__func__);
+			} else {
+				pr_err("%s: H7000 ioremap TLMM failed\n",
+					__func__);
+			}
+		}
 		/* Check if msm needs to provide the clock to the interface */
 		if (!mi2s_intf_conf[index].msm_is_mi2s_master) {
 			mi2s_clk[index].clk_id = mi2s_ebit_clk[index];
 			fmt = SND_SOC_DAIFMT_CBM_CFM;
 		}
+		pr_info("%s: master=%d clk_id=%u freq=%u fmt=0x%x\n",
+			__func__, mi2s_intf_conf[index].msm_is_mi2s_master,
+			mi2s_clk[index].clk_id, mi2s_clk[index].clk_freq_in_hz,
+			fmt);
 		ret = msm_mi2s_set_sclk(substream, true);
 		if (IS_ERR_VALUE(ret)) {
 			dev_err(rtd->card->dev,
@@ -2563,10 +2634,24 @@ int msm_mi2s_snd_startup(struct snd_pcm_substream *substream)
 				__func__, index, ret);
 			goto clk_off;
 		}
-		if (mi2s_intf_conf[index].msm_is_ext_mclk) {
+		/* H7000: SEC_MI2S feeds NXP TFA9891 amps which need MCLK
+		 * (9.6MHz) for DSP cold-boot. Board dts has ext-mclk=0 for SEC
+		 * so the original code never sent the clock command -> cold-boot
+		 * always NAK'd (err107) and no sound. Force-enable MCLK for SEC:
+		 * try ALL four LPASS MCLK outputs - PCB may route the TFA MCLK
+		 * pin to any of MCLK_1..4, not just the default MCLK_4. */
+		if (mi2s_intf_conf[index].msm_is_ext_mclk || index == 1) {
+			int m;
+			for (m = 0; m < MI2S_MAX; m++) {
+				mi2s_mclk[m].enable = 1;
+				pr_info("%s: Enabling mclk[%d] id=%u clk=%u (idx %d)\n",
+					__func__, m, mi2s_mclk[m].clk_id,
+					mi2s_mclk[m].clk_freq_in_hz, index);
+				afe_set_lpass_clock_v2(port_id, &mi2s_mclk[m]);
+			}
 			mi2s_mclk[index].enable = 1;
-			pr_debug("%s: Enabling mclk, clk_freq_in_hz = %u\n",
-				__func__, mi2s_mclk[index].clk_freq_in_hz);
+			pr_info("%s: Enabling mclk, clk_freq_in_hz = %u (idx %d)\n",
+				__func__, mi2s_mclk[index].clk_freq_in_hz, index);
 			ret = afe_set_lpass_clock_v2(port_id,
 						     &mi2s_mclk[index]);
 			if (ret < 0) {
@@ -2601,6 +2686,8 @@ void msm_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
 	int port_id = msm_get_port_id(rtd->dai_link->be_id);
 	int index = rtd->cpu_dai->id;
+	struct pinctrl *mi2s_pinctrl;
+	struct pinctrl_state *mi2s_pinctrl_state;
 
 	pr_debug("%s(): substream = %s  stream = %d\n", __func__,
 		 substream->name, substream->stream);
@@ -2611,6 +2698,14 @@ void msm_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 
 	mutex_lock(&mi2s_intf_conf[index].lock);
 	if (--mi2s_intf_conf[index].ref_cnt == 0) {
+		mi2s_pinctrl = devm_pinctrl_get(rtd->cpu_dai->dev);
+		if (!IS_ERR(mi2s_pinctrl)) {
+			mi2s_pinctrl_state = pinctrl_lookup_state(
+					mi2s_pinctrl, PINCTRL_STATE_SLEEP);
+			if (!IS_ERR(mi2s_pinctrl_state))
+				pinctrl_select_state(mi2s_pinctrl,
+						     mi2s_pinctrl_state);
+		}
 		ret = msm_mi2s_set_sclk(substream, false);
 		if (ret < 0)
 			pr_err("%s:clock disable failed for MI2S (%d); ret=%d\n",
@@ -3053,9 +3148,12 @@ static void i2s_auxpcm_init(struct platform_device *pdev)
 					 "qcom,msm-mi2s-master",
 					 mi2s_master_slave, MI2S_MAX);
 	if (ret) {
-		dev_dbg(&pdev->dev, "%s: no qcom,msm-mi2s-master in DT node\n",
-			__func__);
+		dev_info(&pdev->dev, "%s: no qcom,msm-mi2s-master in DT node %s (ret %d) -> all slave\n",
+			__func__, pdev->dev.of_node->full_name, ret);
 	} else {
+		dev_info(&pdev->dev, "%s: mi2s-master = %u %u %u %u\n", __func__,
+			mi2s_master_slave[0], mi2s_master_slave[1],
+			mi2s_master_slave[2], mi2s_master_slave[3]);
 		for (count = 0; count < MI2S_MAX; count++) {
 			mi2s_intf_conf[count].msm_is_mi2s_master =
 				mi2s_master_slave[count];
