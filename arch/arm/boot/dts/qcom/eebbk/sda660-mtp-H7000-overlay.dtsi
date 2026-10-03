@@ -7,13 +7,6 @@
 #include "battery/sda660-battery-H7000.dtsi"
 #include "display/sda660-display-H7000.dtsi"
 
-&firmware {
-	android {
-		boot_devices = "soc/c0c4000.sdhci";
-		/delete-node/ fstab;
-	};
-};
-
 &i2c_1 {
 	status = "ok";
 
