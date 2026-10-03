@@ -14,10 +14,12 @@
 #include <linux/module.h>
 #include <linux/device.h>
 #include <linux/platform_device.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/mfd/wcd9xxx/core.h>
 #include <linux/bitops.h>
 #include <linux/slab.h>
 #include <linux/clk.h>
+#include <linux/clk-provider.h>
 #include <linux/of_device.h>
 #include <linux/clk/msm-clk.h>
 #include <sound/core.h>
@@ -29,6 +31,11 @@
 #include <sound/pcm_params.h>
 #include <sound/q6core.h>
 #include <soc/qcom/boot_stats.h>
+
+/* H7000 v58: declare msm_anlg_cdc_mclk_enable() directly (msm-analog-cdc.h
+ * cannot be included here - its micbias enums clash with wcd9335.h) */
+extern int msm_anlg_cdc_mclk_enable(struct snd_soc_codec *codec,
+				    int mclk_enable, bool dapm);
 
 #define MSM_DAI_PRI_AUXPCM_DT_DEV_ID 1
 #define MSM_DAI_SEC_AUXPCM_DT_DEV_ID 2
@@ -3771,10 +3778,203 @@ static int msm_dai_q6_dai_mi2s_remove(struct snd_soc_dai *dai)
 	return 0;
 }
 
+/* H7000 v64: handle for the LPASS MCLK clock ("audio_lpass_mclk", also known
+ * as the SPEAKER_I2S_OSR clock, 11.2896MHz) that the two TFA9891 amplifiers
+ * use as reference clock.  Nothing else in this kernel ever enables it: the
+ * audio-ext-clk provider only writes qcom,mclk-clk-reg (0x15020018), selects
+ * the lpi_mclk0 "active" pinctrl state and issues q6afe_set_lpass_clock() for
+ * MCLK_1 from its clk_ops.prepare callback.  Without a consumer the MCLK
+ * never reaches the amps: both chips report NOCLK=1 / AREF=0 / CLKS=0,
+ * tfaRunStartup() times out (err 5) and the DSP never cold-boots -> silence.
+ */
+/*
+ * H7000 v67/v70: bring up the audio reference clocks while SEC MI2S is
+ * playing.  The provider (audio-ext-clk-up.c) exports these clocks and nothing
+ * in this device tree consumes them, so without this they stay off.
+ *
+ * Measured on the v69/v70 builds (the "ret" values are what
+ * clk_prepare_enable() returned on device):
+ *
+ *   audio_ap_clk       -> gpio_direction_output(PM660 GPIO3, 1).  Its .gpio is
+ *                         -EINVAL unless the node has no rpm clock, and this
+ *                         one does (qcom,node_has_rpm_clock), so it is a no-op
+ *                         that still resolves.
+ *   audio_ext_pmi_clk  -> fixed-factor child of the RPM clock "div_clk1".
+ *                         ret 0.
+ *   audio_lpass_mclk   -> LPASS MCLK_1 at qcom,codec-mclk-clk-freq
+ *                         (11.2896 MHz): selects lpi_mclk0, writes 0x15020018.
+ *                         ret 0.
+ *
+ * audio_lpass_mclk2 (AFE Q6AFE_LPASS_CLK_ID_SPEAKER_I2S_OSR) was tried as well
+ * and the ADSP rejected it with -EINVAL, so it is not listed here; the
+ * amplifiers work without it.
+ *
+ * Each clock is resolved through of_clk_get_from_provider() with a clkspec
+ * pointing at the audio_ext_clk node - exactly what <&clock_audio N> does in a
+ * device tree - and identified by name so the DT index cannot be mismatched.
+ * clk_get(NULL, "name") cannot work here: the provider registers through
+ * of_clk_add_provider() and this kernel's clkdev lookup has no clock-name
+ * fallback (verified in drivers/clk/clkdev.c).
+ */
+static const char * const h7000_ref_clk_names[] = {
+	"audio_ap_clk",
+	"audio_ext_pmi_clk",
+	"audio_lpass_mclk",
+};
+#define H7000_NUM_REF_CLKS ARRAY_SIZE(h7000_ref_clk_names)
+static struct clk *h7000_ref_clks[H7000_NUM_REF_CLKS];
+
+static struct clk *h7000_get_ref_clk(const char *want)
+{
+	struct device_node *np;
+	struct of_phandle_args clkspec;
+	struct clk *clk;
+	int i;
+
+	for_each_compatible_node(np, NULL, "qcom,audio-ref-clk") {
+		if (!of_find_property(np, "qcom,mclk-clk-reg", NULL))
+			continue;
+		memset(&clkspec, 0, sizeof(clkspec));
+		clkspec.np = np;
+		clkspec.args_count = 1;
+		for (i = 0; i < 8; i++) {
+			clkspec.args[0] = i;
+			clk = of_clk_get_from_provider(&clkspec);
+			if (IS_ERR(clk))
+				break;
+			if (!strcmp(__clk_get_name(clk), want)) {
+				of_node_put(np);
+				return clk;
+			}
+			clk_put(clk);
+		}
+	}
+	return ERR_PTR(-ENODEV);
+}
+
+static void h7000_put_ref_clks(struct device *dev)
+{
+	int ci;
+
+	for (ci = H7000_NUM_REF_CLKS - 1; ci >= 0; ci--) {
+		if (!h7000_ref_clks[ci])
+			continue;
+		clk_disable_unprepare(h7000_ref_clks[ci]);
+		dev_info(dev, "H7000 ref clk %s released\n",
+			 h7000_ref_clk_names[ci]);
+	}
+}
+
 static int msm_dai_q6_mi2s_startup(struct snd_pcm_substream *substream,
 				   struct snd_soc_dai *dai)
 {
+	/* H7000 v58: the SEC_MI2S_BE dai link runs this cpu DAI startup in
+	 * the DPCM path (machine dai_link ops.startup is NOT invoked for
+	 * BE links - that is why the v55/v56 machine-level hooks never
+	 * fired).  The two TFA9891 amps take their MCLK from INT_MCLK0
+	 * (9.6MHz, PM660L analog codec).  Enable it here on SEC_MI2S
+	 * playback only; no AFE INT0 port start (v44/v45 900E hang). */
+	if (dai->id == MSM_SEC_MI2S) {
+		struct snd_soc_pcm_runtime *rtd = substream->private_data;
+		struct snd_soc_card *card = rtd->card;
+		struct snd_soc_codec *acodec = NULL;
+		struct device_node *np =
+			of_find_compatible_node(NULL, NULL,
+						"qcom,pmic-analog-codec");
+		if (np) {
+			struct snd_soc_codec *c;
+			list_for_each_entry(c, &card->codec_dev_list,
+					    card_list) {
+				if (c->component.dev &&
+				    c->component.dev->of_node == np) {
+					acodec = c;
+					break;
+				}
+			}
+		}
+		if (acodec) {
+			int rc = msm_anlg_cdc_mclk_enable(acodec, 1, true);
+			dev_info(card->dev,
+				 "%s: H7000 SEC anlg mclk enable ret %d\n",
+				 __func__, rc);
+		} else {
+			dev_info(card->dev,
+				 "%s: H7000 analog codec not found\n",
+				 __func__);
+		}
+		/* H7000 v67: bring up every reference clock the TFA9891 amps
+		 * need, before the codec's tfa_start() (DSP cold-boot) runs. */
+		{
+			int ci;
 
+			for (ci = 0; ci < H7000_NUM_REF_CLKS; ci++) {
+				int ret;
+
+				if (!h7000_ref_clks[ci]) {
+					struct clk *c = h7000_get_ref_clk(
+						h7000_ref_clk_names[ci]);
+
+					if (IS_ERR(c)) {
+						dev_info(card->dev,
+							 "%s: H7000 ref clk %s unavailable (%ld)\n",
+							 __func__,
+							 h7000_ref_clk_names[ci],
+							 PTR_ERR(c));
+						continue;
+					}
+					h7000_ref_clks[ci] = c;
+				}
+				ret = clk_prepare_enable(h7000_ref_clks[ci]);
+				dev_info(card->dev,
+					 "%s: H7000 ref clk %s prepare_enable ret %d\n",
+					 __func__, h7000_ref_clk_names[ci], ret);
+			}
+		}
+		/* H7000 v59: drive INT_MCLK0 on the INT0 MI2S RX AFE port -
+		 * the stock internal-codec path (msm_int_enable_dig_cdc_clk
+		 * uses AFE_PORT_ID_INT0_MI2S_RX).  Sending this clock on the
+		 * SEC port (v43 prepare) returns 0 but never drives the
+		 * physical clock -> TFA CLKS stayed 0.  Do NOT start the
+		 * INT0 AFE port here (v44/v45 900E hang). */
+		{
+			struct afe_clk_set ck;
+			int r2;
+			memset(&ck, 0, sizeof(ck));
+			ck.clk_set_minor_version = AFE_API_VERSION_I2S_CONFIG;
+			ck.clk_id = Q6AFE_LPASS_CLK_ID_INT_MCLK_0;
+			ck.clk_freq_in_hz = Q6AFE_LPASS_OSR_CLK_9_P600_MHZ;
+			ck.clk_attri = Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_NO;
+			ck.clk_root = Q6AFE_LPASS_CLK_ROOT_DEFAULT;
+			ck.enable = 1;
+			r2 = afe_set_lpass_clock_v2(AFE_PORT_ID_INT0_MI2S_RX,
+						     &ck);
+			dev_info(card->dev,
+				 "%s: H7000 INT0 INT_MCLK0 clk ret %d\n",
+				 __func__, r2);
+		}
+		/* H7000 v60: the external MI2S master path pairs SEC_MI2S
+		 * with Q6AFE_LPASS_CLK_ID_MCLK_1 (msm_dai_q6_group_mi2s_
+		 * set_clk_param, msm-dai-q6-v2.c:4666) - not INT_MCLK_0.
+		 * The TFA9891 amps need this MCLK to run their audio PLL
+		 * (CLKS bit in STATUS).  Send MCLK_1 @ 9.6MHz on the SEC
+		 * port together with the SEC_IBIT BCLK (v43 prepare
+		 * already sent IBIT; MCLK_1 was missing). */
+		{
+			struct afe_clk_set ck;
+			int r2;
+			memset(&ck, 0, sizeof(ck));
+			ck.clk_set_minor_version = AFE_API_VERSION_I2S_CONFIG;
+			ck.clk_id = Q6AFE_LPASS_CLK_ID_MCLK_1;
+			ck.clk_freq_in_hz = Q6AFE_LPASS_OSR_CLK_9_P600_MHZ;
+			ck.clk_attri = Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_NO;
+			ck.clk_root = Q6AFE_LPASS_CLK_ROOT_DEFAULT;
+			ck.enable = 1;
+			r2 = afe_set_lpass_clock_v2(AFE_PORT_ID_SECONDARY_MI2S_RX,
+						     &ck);
+			dev_info(card->dev, "%s: H7000 SEC MCLK_1 id=%d rate=%u ret=%d\n",
+				 __func__, ck.clk_id, ck.clk_freq_in_hz, r2);
+		}
+	}
 	return 0;
 }
 
@@ -3911,12 +4111,21 @@ static int msm_dai_q6_mi2s_prepare(struct snd_pcm_substream *substream,
 		"dai_data->channels = %u sample_rate = %u\n", __func__,
 		dai->id, port_id, dai_data->channels, dai_data->rate);
 
+	dev_info(dai->dev, "%s: H7000 prepare dai %d port 0x%x ch=%u rate=%u started=%d i2s_cfg sr=%u bm=%u chanmode=%u\n",
+		__func__, dai->id, port_id, dai_data->channels, dai_data->rate,
+		test_bit(STATUS_PORT_STARTED, dai_data->status_mask) ? 1 : 0,
+		dai_data->port_config.i2s.sample_rate,
+		dai_data->port_config.i2s.bit_width,
+		dai_data->port_config.i2s.channel_mode);
+
 	if (!test_bit(STATUS_PORT_STARTED, dai_data->status_mask)) {
 		/* PORT START should be set if prepare called
 		 * in active state.
 		 */
 		rc = afe_port_start(port_id, &dai_data->port_config,
 				    dai_data->rate);
+		dev_info(dai->dev, "%s: H7000 SEC afe_port_start port=0x%x ret=%d\n",
+			__func__, port_id, rc);
 
 		if (IS_ERR_VALUE(rc))
 			dev_err(dai->dev, "fail to open AFE port 0x%x\n",
@@ -3925,6 +4134,39 @@ static int msm_dai_q6_mi2s_prepare(struct snd_pcm_substream *substream,
 			set_bit(STATUS_PORT_STARTED,
 				dai_data->status_mask);
 	}
+	/* H7000 v43: TFA9891 amps take MCLK from INT_MCLK0
+	 * (Q6AFE_LPASS_CLK_ID_INT_MCLK_0 @ 9.6MHz), the stock internal-codec
+	 * path (msm_int_enable_dig_cdc_clk uses this same clock id on
+	 * AFE_PORT_ID_INT0_MI2S_RX). Earlier attempts only sent MCLK1/3/4,
+	 * never the clock the TFA actually consumes -> AREFS stayed 0.
+	 * After the SEC port is started, enable INT_MCLK0 + SEC BCLK. */
+	if (!IS_ERR_VALUE(rc)) {
+		struct afe_clk_set ck;
+		int r2;
+		memset(&ck, 0, sizeof(ck));
+		ck.clk_set_minor_version = AFE_API_VERSION_I2S_CONFIG;
+		ck.clk_id = Q6AFE_LPASS_CLK_ID_INT_MCLK_0;
+		ck.clk_freq_in_hz = Q6AFE_LPASS_OSR_CLK_9_P600_MHZ;
+		ck.clk_attri = Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_NO;
+		ck.clk_root = Q6AFE_LPASS_CLK_ROOT_DEFAULT;
+		ck.enable = 1;
+		r2 = afe_set_lpass_clock_v2(port_id, &ck);
+		dev_info(dai->dev, "%s: H7000 INT_MCLK0(9.6M) clk ret %d\n",
+			__func__, r2);
+		memset(&ck, 0, sizeof(ck));
+		ck.clk_set_minor_version = AFE_API_VERSION_I2S_CONFIG;
+		ck.clk_id = Q6AFE_LPASS_CLK_ID_SEC_MI2S_IBIT;
+		ck.clk_freq_in_hz = Q6AFE_LPASS_IBIT_CLK_1_P536_MHZ;
+		ck.clk_attri = Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_NO;
+		ck.clk_root = Q6AFE_LPASS_CLK_ROOT_DEFAULT;
+		ck.enable = 1;
+		r2 = afe_set_lpass_clock_v2(port_id, &ck);
+		dev_info(dai->dev, "%s: H7000 SEC_IBIT id=%d rate=%u ret=%d\n",
+			__func__, ck.clk_id, ck.clk_freq_in_hz, r2);
+	}
+	dev_info(dai->dev, "%s: H7000 prepare done rc=%d started=%d\n",
+		__func__, rc,
+		test_bit(STATUS_PORT_STARTED, dai_data->status_mask) ? 1 : 0);
 	if (!test_bit(STATUS_PORT_STARTED, dai_data->hwfree_status)) {
 		set_bit(STATUS_PORT_STARTED, dai_data->hwfree_status);
 		dev_dbg(dai->dev, "%s: set hwfree_status to started\n",
@@ -4149,6 +4391,36 @@ static void msm_dai_q6_mi2s_shutdown(struct snd_pcm_substream *substream,
 	}
 	if (test_bit(STATUS_PORT_STARTED, dai_data->hwfree_status))
 		clear_bit(STATUS_PORT_STARTED, dai_data->hwfree_status);
+	/* H7000 v58: release analog-codec INT_MCLK0 when SEC stops */
+	if (dai->id == MSM_SEC_MI2S) {
+		struct snd_soc_pcm_runtime *rtd = substream->private_data;
+		struct snd_soc_card *card = rtd->card;
+		struct snd_soc_codec *acodec = NULL;
+		struct device_node *np =
+			of_find_compatible_node(NULL, NULL,
+						"qcom,pmic-analog-codec");
+		if (np) {
+			struct snd_soc_codec *c;
+			list_for_each_entry(c, &card->codec_dev_list,
+					    card_list) {
+				if (c->component.dev &&
+				    c->component.dev->of_node == np) {
+					acodec = c;
+					break;
+				}
+			}
+		}
+		if (acodec) {
+			msm_anlg_cdc_mclk_enable(acodec, 0, true);
+			dev_info(card->dev, "%s: H7000 SEC anlg mclk released\n",
+				 __func__);
+		}
+		/* H7000 v67: release the reference clocks again when SEC
+		 * playback stops (each provider clock then undoes its own
+		 * part: the LPI pin returns to sleep, the AFE clocks are
+		 * disabled again). */
+		h7000_put_ref_clks(card->dev);
+	}
 }
 
 static struct snd_soc_dai_ops msm_dai_q6_mi2s_ops = {
@@ -5660,6 +5932,34 @@ static int msm_dai_q6_mi2s_dev_probe(struct platform_device *pdev)
 	snprintf(boot_marker, sizeof(boot_marker),
 			"M - DRIVER MSM I2S_%d Ready", mi2s_intf);
 	place_marker(boot_marker);
+
+	/* H7000: select the pinctrl default state (BCLK/WS + SD0/SD1) so the
+	 * TFA9891 amps on SEC_MI2S actually receive the I2S clock. The DT
+	 * dai_mi2s1 node carries pinctrl-0 but no driver selects it on this
+	 * port (BE startup hook does not run) - pins stay MUX UNCLAIMED and
+	 * tfaRunStartup fails NoClock (err5). */
+	{
+		struct pinctrl *h7000_pctl = devm_pinctrl_get(&pdev->dev);
+		if (IS_ERR(h7000_pctl)) {
+			dev_err(&pdev->dev, "h7000: pinctrl get failed (%ld)\n",
+				PTR_ERR(h7000_pctl));
+		} else {
+			struct pinctrl_state *h7000_st = pinctrl_lookup_state(
+					h7000_pctl, PINCTRL_STATE_DEFAULT);
+			if (IS_ERR(h7000_st)) {
+				dev_err(&pdev->dev,
+					"h7000: default state lookup failed (%ld)\n",
+					PTR_ERR(h7000_st));
+			} else if (pinctrl_select_state(h7000_pctl, h7000_st)) {
+				dev_err(&pdev->dev,
+					"h7000: select default failed\n");
+			} else {
+				dev_info(&pdev->dev,
+					"h7000: SEC_MI2S pinmux selected (intf %u)\n",
+					mi2s_intf);
+			}
+		}
+	}
 
 	return 0;
 

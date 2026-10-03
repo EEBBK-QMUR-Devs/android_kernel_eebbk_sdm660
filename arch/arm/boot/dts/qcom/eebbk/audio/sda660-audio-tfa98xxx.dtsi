@@ -116,6 +116,9 @@
 	pinctrl-names = "default", "sleep";
 	pinctrl-0 = <&sec_mi2s_active &sec_mi2s_sd0_active &sec_mi2s_sd1_active>;
 	pinctrl-1 = <&sec_mi2s_sleep &sec_mi2s_sd0_sleep &sec_mi2s_sd1_sleep>;
+	/* H7000: align with stock h7000.dts (rx-lines=1 tx-lines=2) */
+	qcom,msm-mi2s-rx-lines = <1>;
+	qcom,msm-mi2s-tx-lines = <2>;
 };
 
 &tavil_snd {
